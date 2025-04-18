@@ -1,0 +1,112 @@
+import os
+import re
+import logging
+from datetime import datetime
+from dotenv import load_dotenv
+import requests
+from bs4 import BeautifulSoup
+from telegram import Bot
+from telegram.ext import Updater, CommandHandler
+
+# Load environment variables
+load_dotenv()
+
+# Configure logging
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# Global variables
+LAST_CHECKED = None
+PROCESSED_NUMBERS = set()
+BASE_URL = "http://94.23.120.156"
+LOGIN_URL = f"{BASE_URL}/ints/agent/login.php"
+DATA_URL = f"{BASE_URL}/ints/agent/SMSCDRStats"
+
+def solve_captcha(session):
+    try:
+        response = session.get(LOGIN_URL)
+        soup = BeautifulSoup(response.text, 'html.parser')
+        captcha_text = soup.find('label', text=re.compile(r'\d+\s*\+\s*\d+')).text
+        numbers = list(map(int, re.findall(r'\d+', captcha_text)))
+        return sum(numbers)
+    except Exception as e:
+        logger.error(f"Error solving captcha: {e}")
+        return None
+
+def login_to_website(session):
+    try:
+        captcha_answer = solve_captcha(session)
+        if not captcha_answer:
+            return False
+
+        login_data = {
+            'username': os.getenv('WEBSITE_USER'),
+            'password': os.getenv('WEBSITE_PASS'),
+            'captcha': captcha_answer
+        }
+        
+        response = session.post(LOGIN_URL, data=login_data)
+        return "logout.php" in response.text
+    except Exception as e:
+        logger.error(f"Login error: {e}")
+        return False
+
+def scrape_data(session):
+    try:
+        response = session.get(DATA_URL)
+        soup = BeautifulSoup(response.text, 'html.parser')
+        table = soup.find('table', {'class': 'data'})
+        rows = table.find_all('tr')[1:]  # Skip header
+        
+        new_messages = []
+        for row in rows:
+            cols = row.find_all('td')
+            number = cols[0].text.strip()
+            sms = cols[1].text.strip()
+            
+            if number not in PROCESSED_NUMBERS:
+                new_messages.append(f"Number: {number}\nSMS: {sms}")
+                PROCESSED_NUMBERS.add(number)
+        
+        return new_messages
+    except Exception as e:
+        logger.error(f"Scraping error: {e}")
+        return []
+
+def check_for_updates(context):
+    global LAST_CHECKED
+    with requests.Session() as session:
+        if login_to_website(session):
+            new_messages = scrape_data(session)
+            if new_messages:
+                for msg in new_messages:
+                    context.bot.send_message(
+                        chat_id=context.job.context,
+                        text=msg
+                    )
+            LAST_CHECKED = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+def start(update, context):
+    chat_id = update.effective_chat.id
+    context.job_queue.run_repeating(
+        check_for_updates,
+        interval=30,
+        first=0,
+        context=chat_id
+    )
+    update.message.reply_text("Monitoring started! 🔄 I'll check every 30 seconds.")
+
+def main():
+    bot = Bot(token=os.getenv('BOT_TOKEN'))
+    updater = Updater(bot=bot, use_context=True)
+
+    updater.dispatcher.add_handler(CommandHandler('start', start))
+
+    updater.start_polling()
+    updater.idle()
+
+if __name__ == '__main__':
+    main()
